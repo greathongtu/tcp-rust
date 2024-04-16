@@ -10,7 +10,7 @@ struct Quad {
     dst: (Ipv4Addr, u16),
 }
 fn main() -> io::Result<()> {
-    let mut connections: HashMap<Quad, tcp::State> = Default::default();
+    let mut connections: HashMap<Quad, tcp::Connection> = Default::default();
     let mut nic = Iface::new("tun0", tun_tap::Mode::Tun)?;
     let mut buf = [0u8; 1504];
     loop {
@@ -28,7 +28,7 @@ fn main() -> io::Result<()> {
                 let src = ip_header.source_addr();
                 let dst = ip_header.destination_addr();
                 // proto == 1 means ICMP, which is from ping
-                // proto == 0x11 means UDP, 6 means TCP
+                // proto == 0x11 means UDP, 0x06 means TCP
                 let proto = ip_header.protocol();
 
                 if proto != 0x06 {
