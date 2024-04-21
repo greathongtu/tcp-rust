@@ -33,11 +33,11 @@ pub struct Connection {
 
 struct SendSequenceSpace {
     /// send unacknowledged
-    una: usize,
+    una: u32,
     /// send next
-    nxt: usize,
+    nxt: u32,
     /// send window
-    wnd: usize,
+    wnd: u16,
     /// send urgent pointer
     up: bool,
     /// segment sequence number used for last window update
@@ -45,7 +45,7 @@ struct SendSequenceSpace {
     /// segment acknowledged number used for last window update
     wil2: usize,
     /// initial send sequence number
-    iss: usize,
+    iss: u32,
 }
 
 /// State of Receive Sequence Space (RFC 793 S3.2 Figure 5)
@@ -63,82 +63,91 @@ struct SendSequenceSpace {
 /// ```
 struct RecvSequenceSpace {
     /// receive next
-    nxt: usize,
+    nxt: u32,
     /// receive window
-    wnd: usize,
+    wnd: u16,
     /// receive urgent pointer
     up: bool,
     /// initial receive sequence number
-    irs: usize,
-}
-
-impl Default for Connection {
-    fn default() -> Self {
-        // State::Closed
-        Connection {
-            state: State::Listen,
-        }
-    }
+    irs: u32,
 }
 
 impl Connection {
+    pub fn accept(
+        nic: &mut Iface,
+        ip_header: etherparse::Ipv4HeaderSlice,
+        tcp_header: etherparse::TcpHeaderSlice,
+        data: &[u8],
+    ) -> io::Result<Option<Self>> {
+        let mut buf = [0u8; 1500];
+        // expect syn
+        if !tcp_header.syn() {
+            return Ok(None);
+        }
+
+        let iss = 0;
+
+        let mut c = Connection {
+            state: State::SynRcvd,
+            send: SendSequenceSpace {
+                iss,
+                una: iss,
+                nxt: iss + 1,
+                wnd: 10,
+                up: false,
+                wil1: 0,
+                wil2: 0,
+            },
+            recv: RecvSequenceSpace {
+                irs: tcp_header.sequence_number(),
+                nxt: tcp_header.sequence_number() + 1,
+                wnd: tcp_header.window_size(),
+                up: false,
+            },
+        };
+
+        // need to establish a connection
+        // send syn, ack
+        let mut syn_ack = etherparse::TcpHeader::new(
+            tcp_header.destination_port(),
+            tcp_header.source_port(),
+            // TODO
+            // sequence number
+            c.send.iss,
+            // window size
+            c.send.wnd,
+        );
+        syn_ack.acknowledgment_number = c.recv.nxt;
+        syn_ack.syn = true;
+        syn_ack.ack = true;
+        let mut ip = etherparse::Ipv4Header::new(
+            syn_ack.header_len(),
+            64,
+            // 0x06 means TCP, 0x01 means ICMP
+            6,
+            ip_header.destination_addr().octets(),
+            ip_header.source_addr().octets(),
+        );
+
+        syn_ack.checksum = syn_ack
+            .calc_checksum_ipv4(&ip, &[])
+            .expect("failed to compute checksum");
+
+        let mut unwritten = &mut buf[..];
+        ip.write(&mut unwritten);
+        syn_ack.write(&mut unwritten);
+        let unwritten_len = unwritten.len();
+
+        nic.send(&buf[..buf.len() - unwritten_len])?;
+        Ok(Some(c))
+    }
     pub fn on_packet(
         &mut self,
         nic: &mut Iface,
-        ip_header: &etherparse::Ipv4HeaderSlice,
-        tcp_header: &etherparse::TcpHeaderSlice,
+        ip_header: etherparse::Ipv4HeaderSlice,
+        tcp_header: etherparse::TcpHeaderSlice,
         data: &[u8],
     ) -> io::Result<usize> {
-        let mut buf = [0u8; 1500];
-        match self.state {
-            State::Closed => {
-                return Ok(0);
-            }
-            State::Listen => {
-                // expect syn
-                if !tcp_header.syn() {
-                    return Ok(0);
-                }
-
-                // need to establish a connection
-                // send syn, ack
-                let mut syn_ack = etherparse::TcpHeader::new(
-                    tcp_header.destination_port(),
-                    tcp_header.source_port(),
-                    // TODO
-                    // sequence number
-                    0,
-                    // window size
-                    0,
-                );
-                syn_ack.syn = true;
-                syn_ack.ack = true;
-                let mut ip = etherparse::Ipv4Header::new(
-                    syn_ack.header_len(),
-                    64,
-                    // 0x06 means TCP, 0x01 means ICMP
-                    6,
-                    ip_header.destination_addr().octets(),
-                    ip_header.source_addr().octets(),
-                );
-
-                let mut unwritten = &mut buf[..];
-                ip.write(&mut unwritten);
-                syn_ack.write(&mut unwritten);
-                let unwritten_len = unwritten.len();
-                nic.send(&buf[..unwritten_len]);
-            }
-            State::SynRcvd => {}
-            State::Estab => {}
-        }
-        eprintln!(
-            "{}:{} -> {}:{} {}b of tcp",
-            ip_header.source_addr(),
-            tcp_header.source_port(),
-            ip_header.destination_addr(),
-            tcp_header.destination_port(),
-            data.len()
-        );
         Ok(0)
     }
 }
