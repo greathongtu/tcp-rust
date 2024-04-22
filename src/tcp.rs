@@ -2,17 +2,29 @@ use std::io;
 
 use tun_tap::Iface;
 
+#[derive(Debug)]
 pub enum State {
-    Closed,
-    Listen,
+    // Closed,
+    // Listen,
     SynRcvd,
     Estab,
+}
+
+impl State {
+    fn is_synchronized(&self) -> bool {
+        match *self {
+            State::SynRcvd => false,
+            State::Estab => true,
+        }
+    }
 }
 
 pub struct Connection {
     pub state: State,
     send: SendSequenceSpace,
     recv: RecvSequenceSpace,
+    ip: etherparse::Ipv4Header,
+    tcp: etherparse::TcpHeader,
 }
 
 /// State of Send Sequence Space (RFC 793 S3.2 Figure 4)
@@ -34,7 +46,7 @@ pub struct Connection {
 struct SendSequenceSpace {
     /// send unacknowledged
     una: u32,
-    /// send next
+    /// next sequence number to send
     nxt: u32,
     /// send window
     wnd: u16,
@@ -86,13 +98,13 @@ impl Connection {
         }
 
         let iss = 0;
-
+        let wnd = 10;
         let mut c = Connection {
             state: State::SynRcvd,
             send: SendSequenceSpace {
                 iss,
                 una: iss,
-                nxt: iss + 1,
+                nxt: iss,
                 wnd: 10,
                 up: false,
                 wil1: 0,
@@ -104,42 +116,76 @@ impl Connection {
                 wnd: tcp_header.window_size(),
                 up: false,
             },
+            ip: etherparse::Ipv4Header::new(
+                0,
+                64,
+                // 0x06 means TCP, 0x01 means ICMP
+                6,
+                ip_header.destination_addr().octets(),
+                ip_header.source_addr().octets(),
+            ),
+            tcp: etherparse::TcpHeader::new(
+                tcp_header.destination_port(),
+                tcp_header.source_port(),
+                // TODO
+                // sequence number
+                iss,
+                // window size
+                wnd,
+            ),
         };
 
         // need to establish a connection
         // send syn, ack
-        let mut syn_ack = etherparse::TcpHeader::new(
-            tcp_header.destination_port(),
-            tcp_header.source_port(),
-            // TODO
-            // sequence number
-            c.send.iss,
-            // window size
-            c.send.wnd,
-        );
-        syn_ack.acknowledgment_number = c.recv.nxt;
-        syn_ack.syn = true;
-        syn_ack.ack = true;
-        let mut ip = etherparse::Ipv4Header::new(
-            syn_ack.header_len(),
-            64,
-            // 0x06 means TCP, 0x01 means ICMP
-            6,
-            ip_header.destination_addr().octets(),
-            ip_header.source_addr().octets(),
-        );
 
-        syn_ack.checksum = syn_ack
-            .calc_checksum_ipv4(&ip, &[])
+        c.tcp.acknowledgment_number = c.recv.nxt;
+        c.tcp.syn = true;
+        c.tcp.ack = true;
+        c.write(nic, &[])?;
+        Ok(Some(c))
+    }
+
+    fn write(&mut self, nic: &mut tun_tap::Iface, payload: &[u8]) -> io::Result<usize> {
+        let mut buf = [0u8; 1500];
+        self.tcp.sequence_number = self.send.nxt;
+        self.tcp.acknowledgment_number = self.recv.nxt;
+        let size = std::cmp::min(
+            buf.len(),
+            self.tcp.header_len() as usize + self.ip.header_len() as usize + payload.len(),
+        );
+        self.ip.set_payload_len(size);
+
+        self.tcp.checksum = self
+            .tcp
+            .calc_checksum_ipv4(&self.ip, &[])
             .expect("failed to compute checksum");
 
+        use std::io::Write;
         let mut unwritten = &mut buf[..];
-        ip.write(&mut unwritten);
-        syn_ack.write(&mut unwritten);
+        self.ip.write(&mut unwritten);
+        self.tcp.write(&mut unwritten);
+        let payload_bytes = unwritten.write(payload)?;
         let unwritten_len = unwritten.len();
-
+        self.send.nxt = self.send.nxt.wrapping_add(payload_bytes as u32);
+        if self.tcp.syn {
+            self.send.nxt = self.send.nxt.wrapping_add(1);
+            self.tcp.syn = false;
+        }
+        if self.tcp.fin {
+            self.send.nxt = self.send.nxt.wrapping_add(1);
+            self.tcp.fin = false;
+        }
         nic.send(&buf[..buf.len() - unwritten_len])?;
-        Ok(Some(c))
+        Ok(payload_bytes)
+    }
+
+    fn send_rst(&mut self, nic: &mut tun_tap::Iface) -> io::Result<()> {
+        self.tcp.rst = true;
+
+        self.tcp.sequence_number = 0;
+        self.tcp.acknowledgment_number = 0;
+        self.write(nic, &[])?;
+        Ok(())
     }
     pub fn on_packet(
         &mut self,
@@ -147,7 +193,77 @@ impl Connection {
         ip_header: etherparse::Ipv4HeaderSlice,
         tcp_header: etherparse::TcpHeaderSlice,
         data: &[u8],
-    ) -> io::Result<usize> {
-        Ok(0)
+    ) -> io::Result<()> {
+        // first, check that sequence numbers are valid (RFC 793 S3.3)
+        let ackn = tcp_header.acknowledgment_number();
+        if !is_between_wrapped(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
+            if !self.state.is_synchronized() {
+                // need to send RST
+                self.send_rst(nic);
+            }
+            return Ok(());
+        }
+
+        // valid segment check
+        let seqn = tcp_header.sequence_number();
+        let mut slen = data.len() as u32;
+        if tcp_header.fin() {
+            slen += 1;
+        };
+        if tcp_header.syn() {
+            slen += 1;
+        };
+        let wend = self.recv.nxt.wrapping_add(self.recv.wnd as u32);
+        if slen == 0 {
+            if self.recv.wnd == 0 {
+                if seqn != self.recv.nxt {
+                    return Ok(());
+                }
+            } else if !is_between_wrapped(self.recv.nxt.wrapping_sub(1), seqn, wend) {
+                return Ok(());
+            }
+        } else {
+            if self.recv.wnd == 0 {
+                return Ok(());
+            } else if !is_between_wrapped(self.recv.nxt.wrapping_sub(1), seqn, wend)
+                && !is_between_wrapped(self.recv.nxt.wrapping_sub(1), seqn + slen - 1, wend)
+            {
+                return Ok(());
+            }
+        }
+
+        match self.state {
+            State::SynRcvd => {
+                // expect their ack for our sent syn
+                if !tcp_header.ack() {
+                    return Ok(());
+                }
+                self.state = State::Estab;
+            }
+            State::Estab => {
+                unimplemented!();
+            }
+        }
     }
+}
+
+fn is_between_wrapped(start: u32, x: u32, end: u32) -> bool {
+    use std::cmp::Ordering;
+    match start.cmp(&x) {
+        Ordering::Equal => {
+            return false;
+        }
+        Ordering::Less => {
+            if end >= start && end <= x {
+                return false;
+            }
+        }
+        Ordering::Greater => {
+            if end >= x && end < start {
+            } else {
+                return false;
+            }
+        }
+    }
+    true
 }
